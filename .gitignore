@@ -1,0 +1,27 @@
+# ---- 构建产物 ----
+dist/
+build/
+*.spec
+*.exe
+
+# ---- EPUB 制品 ----
+*.epub
+
+# ---- 测试 / 演示输出 ----
+selftest_output/
+unpack_demo/
+*.log
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 打包/解包临时目录 ----
+.epub_build_*/
+.epub_append_*/
+.epub_cover_*/
+
+# ---- 系统文件 ----
+Thumbs.db
+Desktop.ini
