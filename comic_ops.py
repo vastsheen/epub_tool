@@ -312,11 +312,19 @@ def pdf_to_cbz(pdf_path, out_path, series, title, number,
         reader.decrypt('')
 
     w = CbzWriter(out_path)
-    stats = {'pages': 0, 'spreads': 0, 'passthrough': 0, 'reencoded': 0, 'cover': ''}
+    stats = {'pages': 0, 'spreads': 0, 'passthrough': 0, 'reencoded': 0,
+             'cover': '', 'failed': []}
     try:
         for idx, page in enumerate(reader.pages):
-            pil, raw, _filt = pdf_page_image(page)
+            try:
+                pil, raw, _filt = pdf_page_image(page)
+            except Exception as e:
+                stats['failed'].append(('第 %d 页' % (idx + 1), str(e)))
+                log('    ! 第 %d 页读取失败，已跳过（%s）' % (idx + 1, e))
+                continue
             if pil is None and raw is None:
+                stats['failed'].append(('第 %d 页' % (idx + 1), '没有内嵌图片'))
+                log('    ! 第 %d 页没有内嵌图片，已跳过' % (idx + 1))
                 continue
             width, height = pil.size if pil is not None else (0, 0)
             ratio = (width / float(height)) if height else 0
@@ -340,44 +348,101 @@ def pdf_to_cbz(pdf_path, out_path, series, title, number,
                     stats['spreads'] += 1
 
             for part_pil, part_raw in parts:
-                resized = (max_width and part_pil is not None and part_pil.width > max_width)
-                if part_raw is not None and part_raw[:3] == JPEG_MAGIC and not resized:
-                    w.add_raw_jpeg(part_raw)
-                    stats['passthrough'] += 1
-                elif part_pil is not None:
-                    w.add(part_pil, quality, max_width)
-                    stats['reencoded'] += 1
+                try:
+                    resized = (max_width and part_pil is not None
+                               and part_pil.width > max_width)
+                    if part_raw is not None and part_raw[:3] == JPEG_MAGIC and not resized:
+                        w.add_raw_jpeg(part_raw)
+                        stats['passthrough'] += 1
+                    elif part_pil is not None:
+                        w.add(part_pil, quality, max_width)
+                        stats['reencoded'] += 1
+                except Exception as e:
+                    stats['failed'].append(('第 %d 页' % (idx + 1), str(e)))
+                    log('    ! 第 %d 页解码/编码失败，已跳过（%s）' % (idx + 1, e))
         stats['pages'] = w.close(series, number, title, manga='YesAndRightToLeft', year=year)
     except Exception:
         w.zf.close()
         raise
 
+    if stats['pages'] == 0:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise ValueError('这个 PDF 里没有一页能读出来')
+
     stats['mb'] = round(os.path.getsize(out_path) / 1024.0 / 1024.0, 2)
     stats['seconds'] = round(time.time() - t0, 1)
-    log('  %s：%d 页（跨页 %d，原样透传 %d，重编码 %d），%.1f MB，%.0fs'
+    log('  %s：%d 页（跨页 %d，原样透传 %d，重编码 %d），%.1f MB，%.0fs%s'
         % (os.path.basename(out_path), stats['pages'], stats['spreads'],
-           stats['passthrough'], stats['reencoded'], stats['mb'], stats['seconds']))
+           stats['passthrough'], stats['reencoded'], stats['mb'], stats['seconds'],
+           ('，%d 页被跳过' % len(stats['failed'])) if stats['failed'] else ''))
     return stats
 
 
 # ---------------------------------------------------------------- 图片输入
 
+def _open_image(path):
+    """打开图片并强制解码。返回 (image, note)。
+
+    Pillow 默认是惰性解码，坏数据要等到 load()/convert() 才炸；
+    先正常解码，失败再开 LOAD_TRUNCATED_IMAGES 容错重试一次
+    （截断的 JPEG 通常能解出前面部分，缺失区域是灰/黑）。
+    """
+    Image = _pil()
+    from PIL import ImageFile
+    try:
+        im = Image.open(path)
+        im.load()
+        return im, None
+    except Exception as first:
+        old = ImageFile.LOAD_TRUNCATED_IMAGES
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        try:
+            im = Image.open(path)
+            im.load()
+            return im, '文件可能已截断，已容错读取（缺失部分会显示为灰/黑）'
+        except Exception:
+            raise first
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = old
+
+
 def images_to_cbz(files, out_path, series, title, number,
                   quality=92, split=True, white_thr=250, min_gap=60,
                   min_ink=40, pad=8, max_width=0, log=None, year=''):
-    """一组图片（可能是拼接长图）-> CBZ。split=True 时按白带切回分镜。"""
+    """一组图片（可能是拼接长图）-> CBZ。split=True 时按白带切回分镜。
+
+    单个文件读不出来不会中断整话：跳过、点名、记进 failed。
+    """
     log = log or (lambda m: None)
-    Image = _pil()
     w = CbzWriter(out_path)
     bands_total = 0
+    failed = []
     try:
         for path in files:
-            im = Image.open(path).convert('RGB')
+            try:
+                im, note = _open_image(path)
+                if note:
+                    log('    ~ %s：%s' % (os.path.basename(path), note))
+                im = im.convert('RGB')
+            except Exception as e:
+                failed.append((path, str(e)))
+                log('    ! 读取失败，已跳过：%s（%s）' % (os.path.basename(path), e))
+                continue
+
             if not split:
                 w.add(im, quality, max_width)
                 bands_total += 1
                 continue
-            for (top, bot) in content_bands(im, white_thr, min_gap, min_ink):
+            try:
+                bands = content_bands(im, white_thr, min_gap, min_ink)
+            except Exception as e:
+                failed.append((path, '切分失败：%s' % e))
+                log('    ! 切分失败，已跳过：%s（%s）' % (os.path.basename(path), e))
+                continue
+            for (top, bot) in bands:
                 t = max(0, top - pad)
                 b = min(im.height - 1, bot + pad)
                 w.add(im.crop((0, t, im.width, b + 1)), quality, max_width)
@@ -386,9 +451,20 @@ def images_to_cbz(files, out_path, series, title, number,
     except Exception:
         w.zf.close()
         raise
+
+    if pages == 0:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise ValueError('本话所有图片都读取失败')
+
     mb = round(os.path.getsize(out_path) / 1024.0 / 1024.0, 2)
-    log('  %s：%d 源文件 -> %d 页，%.1f MB' % (os.path.basename(out_path), len(files), pages, mb))
-    return {'pages': pages, 'sources': len(files), 'bands': bands_total, 'mb': mb}
+    log('  %s：%d 源文件 -> %d 页，%.1f MB%s'
+        % (os.path.basename(out_path), len(files), pages, mb,
+           ('，%d 个文件被跳过' % len(failed)) if failed else ''))
+    return {'pages': pages, 'sources': len(files), 'bands': bands_total,
+            'mb': mb, 'failed': failed}
 
 
 # ---------------------------------------------------------------- 统一入口
@@ -456,17 +532,26 @@ def convert(src, outdir, series='', mode='auto', log=None, progress=None,
         if not files:
             raise ValueError('目录里没有 PDF')
         kw = dict(pdf_kw or {})
+        problems = []
         for i, path in enumerate(files, 1):
             number, title = parse_pdf_name(path)
             number = number.zfill(2) if number.isdigit() else number
             name = re.sub(r'\s+', ' ', '%s 第%s卷 %s.cbz' % (series, number, title)).strip()
             out = os.path.join(outdir, name)
             log('[%d/%d] %s' % (i, len(files), os.path.basename(path)))
-            st = pdf_to_cbz(path, out, series, title, number,
-                            quality=quality, log=log, **kw)
+            try:
+                st = pdf_to_cbz(path, out, series, title, number,
+                                quality=quality, log=log, **kw)
+            except Exception as e:
+                problems.append((os.path.basename(path), str(e)))
+                log('  !! 转换失败，已跳过：%s（%s）' % (os.path.basename(path), e))
+                continue
             results.append((out, st))
+            for name_, why in st.get('failed', []):
+                problems.append(('%s %s' % (os.path.basename(path), name_), why))
             if progress:
                 progress(i, len(files), out)
+        _report(log, problems, len(results))
         return results
 
     kw = dict(img_kw or {})
@@ -475,6 +560,7 @@ def convert(src, outdir, series='', mode='auto', log=None, progress=None,
         raise ValueError('没有找到图片（jpg / png / webp …）')
     keys = sorted(groups, key=lambda k: (natural_key(k[0]), natural_key(k[1])))
     log('共 %d 话，%d 个源文件' % (len(keys), sum(len(v) for v in groups.values())))
+    problems = []
     for i, key in enumerate(keys, 1):
         rel, chapter = key
         files = [p for _, p in groups[key]]
@@ -485,12 +571,34 @@ def convert(src, outdir, series='', mode='auto', log=None, progress=None,
             name = '%s %s [%s].cbz' % (series, title, rel.replace(os.sep, '_'))
         out = os.path.join(outdir, name)
         log('[%d/%d] %s <- %d 个源文件' % (i, len(keys), title, len(files)))
-        st = images_to_cbz(files, out, series, number, title,
-                           quality=quality, log=log, **kw)
+        try:
+            st = images_to_cbz(files, out, series, number, title,
+                               quality=quality, log=log, **kw)
+        except Exception as e:
+            problems.append((title, str(e)))
+            log('  !! %s 转换失败，已跳过（%s）' % (title, e))
+            continue
         results.append((out, st))
+        for path, why in st.get('failed', []):
+            try:
+                shown = os.path.relpath(path, src)
+            except ValueError:
+                shown = path
+            problems.append((shown, why))
         if progress:
             progress(i, len(keys), out)
+    _report(log, problems, len(results))
     return results
+
+
+def _report(log, problems, ok_count):
+    """收尾汇总：哪些文件/页没读出来，一眼能看到。"""
+    if not problems:
+        log('全部完成：%d 个 CBZ' % ok_count)
+        return
+    log('完成 %d 个 CBZ，但有 %d 处问题：' % (ok_count, len(problems)))
+    for name, why in problems:
+        log('  - %s：%s' % (name, why))
 
 
 # ---------------------------------------------------------------- 命令行

@@ -291,6 +291,58 @@ class TestImagesToCbz(TempDirCase):
         self.assertEqual(st['pages'], 1)
 
 
+@unittest.skipUnless(HAS_PIL, '需要 Pillow')
+class TestCorruptInput(TempDirCase):
+    """坏图/截断图不能让整个任务中断，而且要能说出是哪个文件。"""
+
+    def _img(self, name, h=400):
+        im = Image.new('RGB', (120, h), (10, 10, 10))
+        p = self.path(name)
+        im.save(p, format='JPEG')
+        return p
+
+    def test_truncated_jpeg_is_named(self):
+        good = self._img('001_01.jpg')
+        bad = self._img('001_02.jpg')
+        with open(bad, 'rb') as f:
+            data = f.read()
+        with open(bad, 'wb') as f:
+            f.write(data[:len(data) // 2])
+
+        msgs = []
+        out = self.path('a.cbz')
+        st = co.images_to_cbz([good, bad], out, '书', '第001话', '001', pad=0,
+                              log=msgs.append)
+        self.assertTrue(os.path.exists(out))
+        self.assertGreaterEqual(st['pages'], 1)
+        joined = '\n'.join(msgs)
+        self.assertIn('001_02.jpg', joined, joined)
+
+    def test_fully_broken_file_is_skipped_and_reported(self):
+        good = self._img('001_01.jpg')
+        bad = self.path('001_02.jpg')
+        with open(bad, 'wb') as f:
+            f.write(b'not an image at all')
+
+        msgs = []
+        out = self.path('b.cbz')
+        st = co.images_to_cbz([good, bad], out, '书', '第001话', '001', pad=0,
+                              log=msgs.append)
+        self.assertEqual(len(st['failed']), 1)
+        self.assertIn('001_02.jpg', st['failed'][0][0])
+        self.assertEqual(st['pages'], 1)
+        self.assertTrue(any('跳过' in m for m in msgs), msgs)
+
+    def test_all_broken_raises_and_leaves_no_file(self):
+        bad = self.path('001_01.jpg')
+        with open(bad, 'wb') as f:
+            f.write(b'xx')
+        out = self.path('c.cbz')
+        with self.assertRaises(ValueError):
+            co.images_to_cbz([bad], out, '书', '第001话', '001')
+        self.assertFalse(os.path.exists(out))
+
+
 @unittest.skipUnless(HAS_PIL and HAS_PYPDF, '需要 Pillow + pypdf')
 class TestPdfToCbz(TempDirCase):
     def _pdf(self, sizes, name='第1卷-测试.pdf'):
