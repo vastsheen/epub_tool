@@ -4,6 +4,9 @@
   1. 目录打包：目录内每个 txt/md 文件 = 一章，整体打成一本 epub
   2. 单文件切割打包：把单个 txt 按切割方式切分章节后打包（切割方式可扩展/下拉选择）
   3. EPUB 追加章节：指定 epub + 若干 txt（每个 txt 一章），解包-追加-重打包
+  4. 封面管理：检测 / 预览 / 替换 epub 封面
+  5. EPUB→TXT 拆解：把 epub 还原成可再次合包的 txt
+  6. 漫画→CBZ：单行本 PDF 或条漫/散图目录打包成 CBZ（v1.3，需 Pillow/pypdf）
 
 运行：python epub_tool.py        （或双击 启动工具.bat）
 自检：python epub_tool.py --selftest
@@ -30,7 +33,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 APP_NAME = "EPUB 工具箱"
-VERSION = "1.2"
+VERSION = "1.3"
 
 # ============================================================
 # 一、核心逻辑（无 GUI 依赖，可独立测试）
@@ -1919,6 +1922,7 @@ class EpubToolApp(tk.Tk):
         self.tab3 = self._build_tab3(nb)
         self.tab4 = self._build_tab4(nb)
         self.tab5 = self._build_tab5(nb)
+        self.tab6 = self._build_tab6(nb)
 
     # ---- 元数据 ----
     def _meta_summary(self):
@@ -2522,6 +2526,99 @@ class EpubToolApp(tk.Tk):
 
         run_btn = ttk.Button(tab, text="拆解导出", command=run)
         run_btn.grid(row=5, column=0, columnspan=3, pady=12)
+        return tab
+
+    # ---- Tab6 漫画/条漫 -> CBZ ----
+    def _build_tab6(self, nb):
+        import comic_ops
+        tab = ttk.Frame(nb)
+        nb.add(tab, text="  6 漫画→CBZ  ")
+        var_src = tk.StringVar()
+        var_series = tk.StringVar()
+        var_out = tk.StringVar()
+        var_mode = tk.StringVar(value='auto')
+        var_strip = tk.BooleanVar(value=True)     # 图片：按白带切分长图
+        var_pdfsplit = tk.BooleanVar(value=False)  # PDF：拆双页跨页
+        var_quality = tk.StringVar(value='92')
+
+        ok, why = comic_ops.deps_available()
+
+        def fill(d):
+            var_src.set(d)
+            if not var_series.get():
+                base = os.path.basename(d) if os.path.isdir(d) else os.path.splitext(os.path.basename(d))[0]
+                var_series.set(base or 'comic')
+            if not var_out.get():
+                var_out.set(os.path.join(d if os.path.isdir(d) else os.path.dirname(d), '_cbz'))
+
+        def browse_dir():
+            d = filedialog.askdirectory(title="选择目录（内含 PDF 或图片）")
+            if d:
+                fill(d)
+
+        def browse_pdf():
+            f = filedialog.askopenfilename(title="选择 PDF", filetypes=[("PDF 文件", "*.pdf")])
+            if f:
+                fill(f)
+
+        ttk.Label(tab, text="单行本 PDF → 每卷一个 CBZ（跨页原样保留）；"
+                            "条漫/散图目录 → 每话一个 CBZ（按白带切回分镜）。",
+                  font=('', 12)).grid(row=0, column=0, columnspan=4, sticky='w',
+                                      padx=12, pady=(14, 6))
+        ttk.Label(tab, text="输入:").grid(row=1, column=0, sticky='w', padx=10, pady=10)
+        ttk.Entry(tab, textvariable=var_src, font=('', 11)).grid(
+            row=1, column=1, sticky='ew', padx=10, pady=10)
+        ttk.Button(tab, text="选目录...", command=browse_dir).grid(row=1, column=2, padx=4, pady=10)
+        ttk.Button(tab, text="选PDF...", command=browse_pdf).grid(row=1, column=3, padx=(0, 10), pady=10)
+
+        f2 = ttk.Frame(tab)
+        f2.grid(row=2, column=0, columnspan=4, sticky='ew', padx=6)
+        f2.grid_columnconfigure(1, weight=1)
+        ttk.Label(f2, text="系列名:").grid(row=0, column=0, sticky='w', padx=4, pady=6)
+        ttk.Entry(f2, textvariable=var_series, font=('', 11)).grid(
+            row=0, column=1, sticky='ew', padx=4, pady=6)
+        ttk.Label(f2, text="质量:").grid(row=0, column=2, sticky='w', padx=(16, 4), pady=6)
+        ttk.Combobox(f2, textvariable=var_quality, values=('95', '92', '88', '85'),
+                     width=5, state='readonly').grid(row=0, column=3, padx=4, pady=6)
+
+        f3 = ttk.Frame(tab)
+        f3.grid(row=3, column=0, columnspan=4, sticky='ew', padx=18)
+        ttk.Checkbutton(f3, text="图片输入：按白带切分长图（推荐）",
+                        variable=var_strip).pack(side='left')
+        ttk.Checkbutton(f3, text="PDF 输入：拆双页跨页（默认保留）",
+                        variable=var_pdfsplit).pack(side='left', padx=(18, 0))
+
+        self._path_row(tab, 4, "输出目录:", self._browse_out(var_out), var_out)
+        log = self._log_area(tab, 5)
+        if not ok:
+            log.insert('end', why + '\n\n安装后重启本工具即可启用这个标签页。\n')
+
+        def run():
+            src = var_src.get().strip()
+            if not src or not os.path.exists(src):
+                log.insert('end', "请先选择输入（PDF 文件或图片目录）\n")
+                return
+            out = var_out.get().strip()
+            if not out:
+                base = src if os.path.isdir(src) else os.path.dirname(src)
+                out = os.path.join(base, '_cbz')
+                var_out.set(out)
+            bus = LogBus()
+
+            def job(lg):
+                comic_ops.convert(
+                    src, out, var_series.get().strip(), mode=var_mode.get(),
+                    log=lg, quality=int(var_quality.get()),
+                    pdf_kw={'split': var_pdfsplit.get()},
+                    img_kw={'split': var_strip.get()})
+                lg("完成，输出目录：%s" % out)
+
+            run_job(run_btn, bus.emit, job)
+            self._poll(bus, log, run_btn)
+
+        run_btn = ttk.Button(tab, text="开始转换", command=run,
+                             state=('normal' if ok else 'disabled'))
+        run_btn.grid(row=6, column=0, columnspan=4, pady=12)
         return tab
 
     def _poll(self, bus, log, state_widget):

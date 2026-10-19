@@ -1,3 +1,10 @@
-# 运行时：无第三方依赖（仅 Python 标准库）
+# 运行时：核心功能（1~5）无第三方依赖，仅 Python 标准库
+#
+# 功能 6「漫画→CBZ」需要的可选依赖；不装只是该标签页禁用，其余功能不受影响：
+#   py -3 -m pip install pillow pypdf cryptography
+pillow>=10.0
+pypdf>=5.0
+cryptography>=41.0
+
 # 打包 exe 时需要的构建依赖：
 pyinstaller>=6.0

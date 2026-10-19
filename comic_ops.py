@@ -1,0 +1,452 @@
+# -*- coding: utf-8 -*-
+"""漫画 / 条漫 -> CBZ
+
+epub_tool v1.3 新增。两种输入，一个出口：
+
+  1. PDF 单行本：每页一张扫描图，双页跨页**原样保留**（阅读器可自己拆），
+     首图若是封底|书脊|封面三段展开，裁出正面当第 1 页。
+  2. 图片目录：
+       * 拼接长图   —— 下载器把多张原图用白带（几百像素）粘成一张超长图，
+                       按白带切回原始分镜，一个分镜一页；
+       * 普通散图   —— 自然排序后直接打包。
+
+分组规则：文件名下划线/连字符前的数字是话号，其后是段号。
+  001_01.jpg, 001_02.jpg -> 第001话（两段按段号合并）
+  005.jpg                -> 第005话
+
+依赖（仅本模块需要，epub_tool 其余功能仍零依赖）：
+  Pillow          图片解码 / 编码 / 白带检测
+  pypdf           读取 PDF
+  cryptography    pypdf 解密 AES 加密的 PDF 时需要
+
+命令行：
+  py -3 comic_ops.py pdf    <pdf 文件或目录> <输出目录> --series 书名
+  py -3 comic_ops.py images <图片目录>      <输出目录> --series 书名
+  py -3 comic_ops.py auto   <任意>          <输出目录> --series 书名
+"""
+from __future__ import annotations
+
+import io
+import os
+import re
+import time
+import zipfile
+from xml.sax.saxutils import escape
+
+IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.tif', '.tiff')
+
+CHAPTER_RE = re.compile(r'^\s*(\d+)\s*[_\-. ]\s*(\d+)\s*$')
+SINGLE_RE = re.compile(r'^\s*(\d+)\s*$')
+
+DEP_HINT = ('缺少依赖：%s\n\n“漫画→CBZ”功能需要 Pillow / pypdf / cryptography，'
+            '其余功能不受影响。安装：\n    py -3 -m pip install pillow pypdf cryptography')
+
+
+# ---------------------------------------------------------------- 依赖
+
+def _pil():
+    try:
+        from PIL import Image
+        return Image
+    except ImportError:
+        raise ImportError(DEP_HINT % 'Pillow')
+
+
+def _pypdf():
+    try:
+        import pypdf
+        return pypdf
+    except ImportError:
+        raise ImportError(DEP_HINT % 'pypdf')
+
+
+def deps_available():
+    """GUI 用来判断是否启用本功能。"""
+    try:
+        _pil()
+        _pypdf()
+        return True, ''
+    except ImportError as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------- 命名与分组
+
+def parse_stem(stem):
+    """'001_01' -> ('001', '01')；'005' -> ('005', None)；'cover' -> (None, None)"""
+    m = CHAPTER_RE.match(stem)
+    if m:
+        return m.group(1), m.group(2)
+    m = SINGLE_RE.match(stem)
+    if m:
+        return m.group(1), None
+    return None, None
+
+
+def natural_key(s):
+    """按数字大小而非字典序排序：第2话 < 第10话。"""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+VOL_RE = re.compile(r'第\s*(\d+)\s*卷[\s\-—_]*(.*)')
+
+
+def parse_pdf_name(path):
+    """'第5卷-NO TIME.pdf' -> ('5', 'NO TIME')；'vol05.pdf' -> ('05', 'vol05')"""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = VOL_RE.search(stem)
+    if m:
+        return m.group(1), (m.group(2).strip(' -—_') or '第%s卷' % m.group(1))
+    m = re.search(r'(\d+)', stem)
+    return (m.group(1) if m else '00'), stem
+
+
+def collect_groups(root):
+    """扫描图片目录 -> {(相对目录, 话号): [(排序键, 路径), ...]}"""
+    groups = {}
+    for dirpath, dirs, files in os.walk(root):
+        dirs.sort()
+        files.sort()
+        rel = os.path.relpath(dirpath, root)
+        rel = '' if rel == '.' else rel
+        for fn in files:
+            if not fn.lower().endswith(IMAGE_EXT):
+                continue
+            stem = os.path.splitext(fn)[0]
+            chapter, seg = parse_stem(stem)
+            if chapter is None:
+                chapter = os.path.basename(dirpath) or '0'
+                seg = None
+            seq = (0, int(seg)) if seg is not None else (1, natural_key(stem))
+            groups.setdefault((rel, chapter), []).append((seq, os.path.join(dirpath, fn)))
+    for key in groups:
+        groups[key].sort(key=lambda t: t[0])
+    return groups
+
+
+# ---------------------------------------------------------------- 白带检测
+
+def _row_is_white(im, thr):
+    """每行是否「整行都够白」。
+
+    只用 Pillow：先把像素二值化，再把宽度压成 1 像素取 BOX 均值 ——
+    一行里只要有一个暗点，均值就 < 255。比逐像素扫 Python 快两个数量级。
+    """
+    Image = _pil()
+    g = im.convert('L')
+    binary = g.point(lambda v: 255 if v >= thr else 0)
+    box = getattr(Image, 'Resampling', Image).BOX
+    col = binary.convert('F').resize((1, g.height), box)
+    data = (col.get_flattened_data() if hasattr(col, 'get_flattened_data')
+            else col.getdata())
+    return [v >= 255.0 for v in data]
+
+
+def content_bands(im, white_thr=250, min_gap=60, min_ink=40):
+    """按白带切出内容块，返回 [(top, bottom)]（含端点）。"""
+    white = _row_is_white(im, white_thr)
+    bands = []
+    i, h = 0, len(white)
+    while i < h:
+        j = i
+        while j < h and white[j] == white[i]:
+            j += 1
+        if not white[i] and (j - i) >= min_ink:
+            if bands and i - bands[-1][1] - 1 < min_gap:
+                bands[-1][1] = j - 1
+            else:
+                bands.append([i, j - 1])
+        i = j
+    if not bands:
+        return [(0, im.height - 1)]
+    return [(a, b) for a, b in bands]
+
+
+# ---------------------------------------------------------------- 图片编码
+
+def jpeg_bytes(im, quality=92, max_width=0):
+    Image = _pil()
+    if max_width and im.width > max_width:
+        r = max_width / float(im.width)
+        lanczos = getattr(Image, 'Resampling', Image).LANCZOS
+        im = im.resize((max_width, max(1, int(im.height * r))), lanczos)
+    buf = io.BytesIO()
+    im.convert('RGB').save(buf, format='JPEG', quality=quality,
+                           optimize=True, progressive=True, subsampling=2)
+    return buf.getvalue()
+
+
+def comic_info_xml(series, number, title, page_count, manga='No', year=''):
+    return ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<ComicInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+            'xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n'
+            '  <Title>%s</Title>\n'
+            '  <Series>%s</Series>\n'
+            '  <Number>%s</Number>\n'
+            '  <Volume>%s</Volume>\n'
+            '  <PageCount>%d</PageCount>\n'
+            '  <Manga>%s</Manga>\n'
+            '  <LanguageISO>zh</LanguageISO>\n'
+            '  <Year>%s</Year>\n'
+            '</ComicInfo>\n') % (escape(title), escape(series), escape(number),
+                                 escape(number), page_count, manga, escape(str(year)))
+
+
+class CbzWriter:
+    """边写边压缩，避免整本 CBZ 都压在内存里。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.zf = zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6)
+        self.pages = 0
+
+    def add(self, im, quality=92, max_width=0):
+        self.pages += 1
+        self.zf.writestr('%04d.jpg' % self.pages, jpeg_bytes(im, quality, max_width))
+
+    def add_raw_jpeg(self, data):
+        self.pages += 1
+        self.zf.writestr('%04d.jpg' % self.pages, data)
+
+    def close(self, series, number, title, manga='No', year=''):
+        self.zf.writestr('ComicInfo.xml',
+                         comic_info_xml(series, number, title, self.pages, manga, year))
+        self.zf.close()
+        return self.pages
+
+
+# ---------------------------------------------------------------- PDF 输入
+
+JPEG_MAGIC = b'\xff\xd8\xff'
+
+
+def pdf_page_image(page):
+    """-> (PIL.Image 或 None, 原始字节 或 None, filter 名)"""
+    try:
+        imgs = page.images
+    except Exception:
+        return None, None, ''
+    if not imgs:
+        return None, None, ''
+    img = imgs[0]
+    raw = pil = None
+    try:
+        raw = img.data
+    except Exception:
+        pass
+    try:
+        pil = img.image
+    except Exception:
+        pass
+    filt = ''
+    try:
+        xo = page['/Resources']['/XObject']
+        for name in xo:
+            obj = xo[name].get_object()
+            if obj.get('/Subtype') == '/Image':
+                filt = str(obj.get('/Filter'))
+                break
+    except Exception:
+        pass
+    return pil, raw, filt
+
+
+def pdf_to_cbz(pdf_path, out_path, series, title, number,
+               quality=92, cover='crop', cover_threshold=1.9,
+               split=False, split_threshold=1.15, max_width=0,
+               log=None, year=''):
+    """单行本 PDF -> CBZ。跨页默认保留（阅读器可自行拆分）。"""
+    log = log or (lambda m: None)
+    pypdf = _pypdf()
+    _pil()
+    t0 = time.time()
+
+    reader = pypdf.PdfReader(pdf_path)
+    if reader.is_encrypted:
+        reader.decrypt('')
+
+    w = CbzWriter(out_path)
+    stats = {'pages': 0, 'spreads': 0, 'passthrough': 0, 'reencoded': 0, 'cover': ''}
+    try:
+        for idx, page in enumerate(reader.pages):
+            pil, raw, _filt = pdf_page_image(page)
+            if pil is None and raw is None:
+                continue
+            width, height = pil.size if pil is not None else (0, 0)
+            ratio = (width / float(height)) if height else 0
+            wide = ratio >= split_threshold
+            parts = []
+
+            if idx == 0 and cover == 'crop' and ratio >= cover_threshold and pil is not None:
+                mid = width // 2
+                parts = [(pil.crop((0, 0, mid, height)), None)]
+                stats['cover'] = 'cropped'
+                stats['spreads'] += 1
+            elif split and wide and pil is not None:
+                mid = width // 2
+                left = pil.crop((0, 0, mid, height))
+                right = pil.crop((mid, 0, width, height))
+                parts = [(right, None), (left, None)]      # 日漫右起
+                stats['spreads'] += 1
+            else:
+                parts = [(pil, raw)]
+                if wide:
+                    stats['spreads'] += 1
+
+            for part_pil, part_raw in parts:
+                resized = (max_width and part_pil is not None and part_pil.width > max_width)
+                if part_raw is not None and part_raw[:3] == JPEG_MAGIC and not resized:
+                    w.add_raw_jpeg(part_raw)
+                    stats['passthrough'] += 1
+                elif part_pil is not None:
+                    w.add(part_pil, quality, max_width)
+                    stats['reencoded'] += 1
+        stats['pages'] = w.close(series, number, title, manga='YesAndRightToLeft', year=year)
+    except Exception:
+        w.zf.close()
+        raise
+
+    stats['mb'] = round(os.path.getsize(out_path) / 1024.0 / 1024.0, 2)
+    stats['seconds'] = round(time.time() - t0, 1)
+    log('  %s：%d 页（跨页 %d，原样透传 %d，重编码 %d），%.1f MB，%.0fs'
+        % (os.path.basename(out_path), stats['pages'], stats['spreads'],
+           stats['passthrough'], stats['reencoded'], stats['mb'], stats['seconds']))
+    return stats
+
+
+# ---------------------------------------------------------------- 图片输入
+
+def images_to_cbz(files, out_path, series, title, number,
+                  quality=92, split=True, white_thr=250, min_gap=60,
+                  min_ink=40, pad=8, max_width=0, log=None, year=''):
+    """一组图片（可能是拼接长图）-> CBZ。split=True 时按白带切回分镜。"""
+    log = log or (lambda m: None)
+    Image = _pil()
+    w = CbzWriter(out_path)
+    bands_total = 0
+    try:
+        for path in files:
+            im = Image.open(path).convert('RGB')
+            if not split:
+                w.add(im, quality, max_width)
+                bands_total += 1
+                continue
+            for (top, bot) in content_bands(im, white_thr, min_gap, min_ink):
+                t = max(0, top - pad)
+                b = min(im.height - 1, bot + pad)
+                w.add(im.crop((0, t, im.width, b + 1)), quality, max_width)
+                bands_total += 1
+        pages = w.close(series, number, title, manga='No', year=year)
+    except Exception:
+        w.zf.close()
+        raise
+    mb = round(os.path.getsize(out_path) / 1024.0 / 1024.0, 2)
+    log('  %s：%d 源文件 -> %d 页，%.1f MB' % (os.path.basename(out_path), len(files), pages, mb))
+    return {'pages': pages, 'sources': len(files), 'bands': bands_total, 'mb': mb}
+
+
+# ---------------------------------------------------------------- 统一入口
+
+def convert(src, outdir, series='', mode='auto', log=None, progress=None,
+            quality=92, pdf_kw=None, img_kw=None):
+    """把 src（PDF 文件 / 包含 PDF 或图片的目录）转换成若干 CBZ。
+
+    mode: 'auto' | 'pdf' | 'images'
+    pdf_kw / img_kw: 分别传给 pdf_to_cbz / images_to_cbz 的参数。
+        两者都有 split，但含义不同（PDF 是拆双页，图片是按白带切分），
+        所以必须分开传，不能共用一个 kwargs。
+    返回 [(输出文件, 统计), ...]
+    """
+    log = log or (lambda m: None)
+    src = os.path.abspath(src)
+    if not os.path.exists(src):
+        raise FileNotFoundError(src)
+    if mode == 'auto':
+        mode = 'pdf' if (os.path.isfile(src) and src.lower().endswith('.pdf')) else 'images'
+
+    if not series:
+        series = (os.path.splitext(os.path.basename(src))[0] if os.path.isfile(src)
+                  else os.path.basename(os.path.normpath(src))) or 'comic'
+    os.makedirs(outdir, exist_ok=True)
+    results = []
+
+    if mode == 'pdf':
+        files = ([src] if os.path.isfile(src) else
+                 sorted((os.path.join(src, f) for f in os.listdir(src)
+                         if f.lower().endswith('.pdf')), key=natural_key))
+        if not files:
+            raise ValueError('目录里没有 PDF')
+        kw = dict(pdf_kw or {})
+        for i, path in enumerate(files, 1):
+            number, title = parse_pdf_name(path)
+            number = number.zfill(2) if number.isdigit() else number
+            name = re.sub(r'\s+', ' ', '%s 第%s卷 %s.cbz' % (series, number, title)).strip()
+            out = os.path.join(outdir, name)
+            log('[%d/%d] %s' % (i, len(files), os.path.basename(path)))
+            st = pdf_to_cbz(path, out, series, title, number,
+                            quality=quality, log=log, **kw)
+            results.append((out, st))
+            if progress:
+                progress(i, len(files), out)
+        return results
+
+    kw = dict(img_kw or {})
+    groups = collect_groups(src)
+    if not groups:
+        raise ValueError('没有找到图片（jpg / png / webp …）')
+    keys = sorted(groups, key=lambda k: (natural_key(k[0]), natural_key(k[1])))
+    log('共 %d 话，%d 个源文件' % (len(keys), sum(len(v) for v in groups.values())))
+    for i, key in enumerate(keys, 1):
+        rel, chapter = key
+        files = [p for _, p in groups[key]]
+        number = chapter.zfill(3) if chapter.isdigit() else chapter
+        title = ('第%s话' % number) if chapter.isdigit() else chapter
+        name = '%s %s.cbz' % (series, title)
+        if rel:
+            name = '%s %s [%s].cbz' % (series, title, rel.replace(os.sep, '_'))
+        out = os.path.join(outdir, name)
+        log('[%d/%d] %s <- %d 个源文件' % (i, len(keys), title, len(files)))
+        st = images_to_cbz(files, out, series, number, title,
+                           quality=quality, log=log, **kw)
+        results.append((out, st))
+        if progress:
+            progress(i, len(keys), out)
+    return results
+
+
+# ---------------------------------------------------------------- 命令行
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description='漫画 / 条漫 -> CBZ')
+    ap.add_argument('mode', choices=['pdf', 'images', 'auto'])
+    ap.add_argument('input')
+    ap.add_argument('outdir')
+    ap.add_argument('--series', default='')
+    ap.add_argument('--quality', type=int, default=92)
+    ap.add_argument('--max-width', type=int, default=0)
+    ap.add_argument('--no-split', action='store_true',
+                    help='图片输入时不按白带切分，整张作一页')
+    ap.add_argument('--pdf-split', action='store_true',
+                    help='PDF 输入时把双页跨页拆成两页（默认保留）')
+    ap.add_argument('--white-thr', type=int, default=250)
+    ap.add_argument('--min-gap', type=int, default=60)
+    ap.add_argument('--min-ink', type=int, default=40)
+    ap.add_argument('--pad', type=int, default=8)
+    args = ap.parse_args(argv)
+
+    pdf_kw = {'split': args.pdf_split, 'cover_threshold': 1.9,
+              'max_width': args.max_width}
+    img_kw = {'split': not args.no_split, 'white_thr': args.white_thr,
+              'min_gap': args.min_gap, 'min_ink': args.min_ink,
+              'pad': args.pad, 'max_width': args.max_width}
+
+    t0 = time.time()
+    res = convert(args.input, args.outdir, args.series, mode=args.mode,
+                  log=print, quality=args.quality, pdf_kw=pdf_kw, img_kw=img_kw)
+    total = sum(st.get('mb', 0) for _o, st in res)
+    print('完成 %d 个文件，共 %.1f MB，%.0fs' % (len(res), total, time.time() - t0))
+
+
+if __name__ == '__main__':
+    main()
