@@ -393,6 +393,39 @@ def images_to_cbz(files, out_path, series, title, number,
 
 # ---------------------------------------------------------------- 统一入口
 
+def default_series(src):
+    """输入路径 -> 默认系列名：目录名，或 PDF 文件名（不带扩展名）。"""
+    if os.path.isdir(src):
+        base = os.path.basename(os.path.normpath(src))
+    else:
+        base = os.path.splitext(os.path.basename(src))[0]
+    return base or 'comic'
+
+
+def default_output(src):
+    """输入路径 -> 默认输出目录：与输入同级（目录则在其下）的 _cbz。"""
+    base = src if os.path.isdir(src) else os.path.dirname(src)
+    return os.path.join(base or '.', '_cbz')
+
+
+class DefaultTracker:
+    """界面默认值的跟随规则。
+
+    用户没动过（空，或仍等于上次自动填的值）就跟随新的输入；
+    用户手动改过就保留，不再被后续选择覆盖。
+    """
+
+    def __init__(self):
+        self._auto = {}
+
+    def apply(self, key, current, new_value):
+        prev = self._auto.get(key)
+        if not current or current == prev:
+            self._auto[key] = new_value
+            return new_value
+        return current
+
+
 def convert(src, outdir, series='', mode='auto', log=None, progress=None,
             quality=92, pdf_kw=None, img_kw=None):
     """把 src（PDF 文件 / 包含 PDF 或图片的目录）转换成若干 CBZ。

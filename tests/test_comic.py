@@ -200,6 +200,47 @@ class TestWhiteBands(unittest.TestCase):
 
 # ---------------------------------------------------------------- 输出 CBZ
 
+class TestDefaults(TempDirCase):
+    """界面默认值：换输入时输出目录要跟着变，但用户手改过就保留。"""
+
+    def test_default_series_and_output_for_dir(self):
+        d = os.path.join(self.tmp, '灌篮高手')
+        os.makedirs(d)
+        self.assertEqual(co.default_series(d), '灌篮高手')
+        self.assertEqual(co.default_output(d), os.path.join(d, '_cbz'))
+
+    def test_default_series_and_output_for_pdf(self):
+        d = os.path.join(self.tmp, '漫画')
+        os.makedirs(d)
+        f = os.path.join(d, '第5卷-NO TIME.pdf')
+        open(f, 'wb').close()
+        self.assertEqual(co.default_series(f), '第5卷-NO TIME')
+        self.assertEqual(co.default_output(f), os.path.join(d, '_cbz'))
+
+    def test_output_follows_new_input(self):
+        t = co.DefaultTracker()
+        first = os.path.join('X:', 'A')
+        second = os.path.join('X:', 'B')
+        self.assertEqual(t.apply('out', '', first), first)
+        self.assertEqual(t.apply('out', first, second), second)
+
+    def test_output_keeps_manual_edit(self):
+        t = co.DefaultTracker()
+        first = os.path.join('X:', 'A')
+        manual = os.path.join('Y:', '我的输出')
+        self.assertEqual(t.apply('out', '', first), first)
+        self.assertEqual(t.apply('out', manual, os.path.join('X:', 'B')), manual)
+        # 手改之后即使再换输入也不覆盖
+        self.assertEqual(t.apply('out', manual, os.path.join('X:', 'C')), manual)
+
+    def test_series_and_output_track_independently(self):
+        t = co.DefaultTracker()
+        self.assertEqual(t.apply('series', '', 'A'), 'A')
+        self.assertEqual(t.apply('out', '', 'O1'), 'O1')
+        self.assertEqual(t.apply('series', 'A', 'B'), 'B')      # 未手改，跟随
+        self.assertEqual(t.apply('out', 'O1', 'O2'), 'O2')
+
+
 @unittest.skipUnless(HAS_PIL, '需要 Pillow')
 class TestImagesToCbz(TempDirCase):
     def _strip_file(self, name, blocks):

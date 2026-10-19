@@ -2574,14 +2574,14 @@ class EpubToolApp(tk.Tk):
         var_quality = tk.StringVar(value='92')
 
         ok, why = comic_ops.deps_available()
+        tracker = comic_ops.DefaultTracker()
 
         def fill(d):
             var_src.set(d)
-            if not var_series.get():
-                base = os.path.basename(d) if os.path.isdir(d) else os.path.splitext(os.path.basename(d))[0]
-                var_series.set(base or 'comic')
-            if not var_out.get():
-                var_out.set(os.path.join(d if os.path.isdir(d) else os.path.dirname(d), '_cbz'))
+            var_series.set(tracker.apply('series', var_series.get(),
+                                         comic_ops.default_series(d)))
+            var_out.set(tracker.apply('out', var_out.get(),
+                                      comic_ops.default_output(d)))
 
         def browse_dir():
             d = filedialog.askdirectory(title="选择目录（内含 PDF 或图片）")
@@ -2632,8 +2632,7 @@ class EpubToolApp(tk.Tk):
                 return
             out = var_out.get().strip()
             if not out:
-                base = src if os.path.isdir(src) else os.path.dirname(src)
-                out = os.path.join(base, '_cbz')
+                out = comic_ops.default_output(src)
                 var_out.set(out)
             bus = LogBus()
 
