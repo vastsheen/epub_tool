@@ -24,6 +24,84 @@ import shutil
 SEP_RE = re.compile(r'^-{12}$')
 CHAP_NAME_RE = re.compile(r'^chap_(\d{4})\.xhtml$')
 
+# ---- 编码 / HTML 小工具（与 epub_tool.py 保持一致；阶段二抽取共享模块后合并） ----
+_BOMS = (
+    (b'\xef\xbb\xbf', 'utf-8-sig'),
+    (b'\xff\xfe\x00\x00', 'utf-32'),
+    (b'\x00\x00\xfe\xff', 'utf-32'),
+    (b'\xff\xfe', 'utf-16'),
+    (b'\xfe\xff', 'utf-16'),
+)
+_CHARSET_RE = re.compile(rb'(?:encoding|charset)\s*=\s*["\']?\s*([A-Za-z0-9_.:-]+)', re.I)
+_CHARSET_ALIASES = {'utf8': 'utf-8', 'gbk': 'gb18030', 'gb2312': 'gb18030',
+                    'gb_2312-80': 'gb18030', 'x-gbk': 'gb18030', 'cp936': 'gb18030'}
+_LIST_OPEN_RE = re.compile(r'<(ol|ul)\b', re.I)
+_LIST_TOKEN_RE = re.compile(r'<(/?)(ol|ul)\b', re.I)
+
+
+def _normalize_encoding(name):
+    key = (name or '').strip().lower()
+    return _CHARSET_ALIASES.get(key, key)
+
+
+def decode_bytes(data):
+    """BOM → 文件头声明 → utf-8 → gb18030 → big5 → 替换。返回 (文本, 编码)。"""
+    for bom, enc in _BOMS:
+        if data.startswith(bom):
+            try:
+                return data.decode(enc), enc
+            except (UnicodeDecodeError, LookupError):
+                break
+    candidates = []
+    m = _CHARSET_RE.search(data[:2048])
+    if m:
+        declared = _normalize_encoding(m.group(1).decode('ascii', 'ignore'))
+        if declared:
+            candidates.append(declared)
+    candidates += ['utf-8', 'gb18030', 'big5']
+    seen = set()
+    for enc in candidates:
+        if enc in seen:
+            continue
+        seen.add(enc)
+        try:
+            return data.decode(enc), enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode('utf-8', errors='replace'), 'utf-8'
+
+
+def _read_text(path):
+    with open(path, 'rb') as f:
+        return decode_bytes(f.read())[0]
+
+
+def _read_text_with_encoding(path):
+    with open(path, 'rb') as f:
+        return decode_bytes(f.read())
+
+
+def _write_text_with_encoding(path, text, encoding='utf-8'):
+    with open(path, 'w', encoding=encoding, newline='') as f:
+        f.write(text)
+
+
+def insert_list_items(markup, items):
+    """把 items 插到最外层 <ol>/<ul> 末尾；多级目录不会插进子列表。"""
+    first = _LIST_OPEN_RE.search(markup)
+    if not first:
+        return markup, False
+    tag = first.group(1).lower()
+    depth = 0
+    for m in _LIST_TOKEN_RE.finditer(markup, first.start()):
+        if m.group(2).lower() != tag:
+            continue
+        depth += -1 if m.group(1) else 1
+        if depth == 0:
+            pos = m.start()
+            return markup[:pos] + items + markup[pos:], True
+    return markup, False
+
 
 def log(*args):
     print(*args)
@@ -59,8 +137,7 @@ def unpack(epub, outdir):
 
 # ---------------- 读取新章节 ----------------
 def read_new_chapters(path):
-    with open(path, "r", encoding="utf-8-sig") as f:
-        text = f.read()
+    text = _read_text(path)
     lines = text.splitlines()
     seps = [i for i, ln in enumerate(lines) if SEP_RE.match(ln)]
     if not seps:
@@ -83,6 +160,10 @@ def read_new_chapters(path):
                 rest = body[j + 1:]
                 break
         chapters.append((title, rest))
+    # 第一个分隔符之前若有内容（简介/前言），作为独立一章保留，避免静默丢失
+    head = lines[:seps[0]]
+    if any(ln.strip() for ln in head):
+        chapters.insert(0, ("前言", head))
     return chapters
 
 
@@ -126,8 +207,7 @@ def append_chapters(epub, new_chapters_path, out_epub):
 
         opf_dir = _find_opf_dir(tmp)
         opf_path = os.path.join(opf_dir, "content.opf")
-        with open(opf_path, "r", encoding="utf-8") as f:
-            opf = f.read()
+        opf, opf_enc = _read_text_with_encoding(opf_path)
 
         # 已有章节命名模式
         manifest_items = re.findall(r'<item id="([^"]+)" href="([^"]+)"', opf)
@@ -188,28 +268,24 @@ def append_chapters(epub, new_chapters_path, out_epub):
         now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         opf = re.sub(r'<meta property="dcterms:modified">[^<]*</meta>',
                      '<meta property="dcterms:modified">' + now + '</meta>', opf, count=1)
-        with open(opf_path, "w", encoding="utf-8") as f:
-            f.write(opf)
+        _write_text_with_encoding(opf_path, opf, opf_enc)
 
         # ---- 更新 nav.xhtml ----
         nav_path = os.path.join(opf_dir, "nav.xhtml")
         if os.path.exists(nav_path):
-            with open(nav_path, "r", encoding="utf-8") as f:
-                nav = f.read()
-            if '</ol>' in nav:
-                ins = "".join('    <li><a href="%s">%s</a></li>\n'
-                              % (fn, _escape(t)) for fn, (t, _b) in zip(new_files, chapters))
-                nav = nav.replace('</ol>', ins + '</ol>', 1)
-                with open(nav_path, "w", encoding="utf-8") as f:
-                    f.write(nav)
+            nav, nav_enc = _read_text_with_encoding(nav_path)
+            ins = "".join('    <li><a href="%s">%s</a></li>\n'
+                          % (fn, _escape(t)) for fn, (t, _b) in zip(new_files, chapters))
+            nav, ok = insert_list_items(nav, ins)
+            if ok:
+                _write_text_with_encoding(nav_path, nav, nav_enc)
             else:
-                log("警告: nav.xhtml 无 <ol>，跳过 nav 更新")
+                log("警告: nav.xhtml 中未找到 <ol>/<ul> 目录列表，跳过 nav 更新")
 
         # ---- 更新 toc.ncx ----
         ncx_path = os.path.join(opf_dir, "toc.ncx")
         if os.path.exists(ncx_path):
-            with open(ncx_path, "r", encoding="utf-8") as f:
-                ncx = f.read()
+            ncx, ncx_enc = _read_text_with_encoding(ncx_path)
             plays = [int(m) for m in re.findall(r'playOrder="(\d+)"', ncx)]
             next_play = max(plays) + 1 if plays else 1
             ins = ""
@@ -221,8 +297,7 @@ def append_chapters(epub, new_chapters_path, out_epub):
                            _escape(t), fn))
             if '</navMap>' in ncx:
                 ncx = ncx.replace('</navMap>', ins + '</navMap>', 1)
-                with open(ncx_path, "w", encoding="utf-8") as f:
-                    f.write(ncx)
+                _write_text_with_encoding(ncx_path, ncx, ncx_enc)
             else:
                 log("警告: toc.ncx 无 </navMap>，跳过 ncx 更新")
 

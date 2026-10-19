@@ -10,6 +10,7 @@ build/
 # ---- 测试 / 演示输出 ----
 selftest_output/
 unpack_demo/
+.testtmp/
 *.log
 
 # ---- Python ----
