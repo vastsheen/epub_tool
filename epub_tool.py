@@ -1255,7 +1255,9 @@ def epub_to_txt(epub, out_txt, as_dir=None, log=None):
 
 def selftest():
     print("== EPUB 工具箱自检 ==")
-    work = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selftest_output")
+    # 打包后 __file__ 指向 PyInstaller 的临时解包目录，产物会丢在那里；
+    # 用 app_dir() 让源码运行和 exe 运行都把结果放在程序目录下。
+    work = os.path.join(app_dir(), "selftest_output")
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, exist_ok=True)
     ok = True
@@ -1395,6 +1397,36 @@ def selftest():
     with open(os.path.join(e_dir, files8[0]), 'r', encoding='utf-8') as f:
         first_line = f.readline().strip()
     check("功能8 首行即章节标题", first_line == "第一章 开始")
+
+    # 功能9：漫画 -> CBZ（可选依赖，缺库时跳过而不是判失败）
+    try:
+        import comic_ops
+        deps_ok, deps_why = comic_ops.deps_available()
+        if not deps_ok:
+            print("SKIP 功能9 漫画→CBZ（%s）" % deps_why.splitlines()[0])
+        else:
+            from PIL import Image as _Image
+            comic_src = os.path.join(work, "comic_src")
+            os.makedirs(comic_src, exist_ok=True)
+            for idx in ("001_01", "001_02"):
+                im = _Image.new('RGB', (120, 400), (30, 30, 30))
+                for y in range(150, 250):
+                    for x in range(120):
+                        im.putpixel((x, y), (255, 255, 255))
+                im.save(os.path.join(comic_src, idx + ".jpg"))
+            comic_out = os.path.join(work, "comic_out")
+            res = comic_ops.convert(comic_src, comic_out, "自检条漫", mode='images',
+                                    img_kw={'split': True, 'pad': 0})
+            check("功能9 生成 1 个 CBZ", len(res) == 1)
+            cbz_path = res[0][0]
+            with zipfile.ZipFile(cbz_path) as z:
+                pages9 = [n for n in z.namelist() if n.endswith('.jpg')]
+                info9 = z.read("ComicInfo.xml").decode('utf-8')
+            # 每张图中间那条白带切成两页 => 2 源文件 x 2 页
+            check("功能9 白带切分成 4 页", len(pages9) == 4)
+            check("功能9 ComicInfo 为条漫(No)", "<Manga>No</Manga>" in info9)
+    except Exception as e:
+        check("功能9 漫画→CBZ（%s）" % e, False)
 
     print("== 自检%s ==" % ("通过" if ok else "失败"))
     print("输出目录:", work)
