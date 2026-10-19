@@ -11,6 +11,7 @@ import io
 import os
 import shutil
 import sys
+import time
 import unittest
 import uuid
 import zipfile
@@ -30,6 +31,15 @@ try:
     HAS_PYPDF = True
 except ImportError:
     HAS_PYPDF = False
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    from tkinter.scrolledtext import ScrolledText
+    import epub_tool as et
+    HAS_TK = True
+except Exception:      # 无显示 / 无 tkinter
+    HAS_TK = False
 
 
 class TempDirCase(unittest.TestCase):
@@ -334,6 +344,79 @@ class TestDeps(unittest.TestCase):
         self.assertIsInstance(ok, bool)
         if not ok:
             self.assertIn('Pillow', why)
+
+
+@unittest.skipUnless(HAS_TK, '需要 tkinter')
+class TestLogPolling(unittest.TestCase):
+    """日志区靠 _poll 轮询把后台线程的输出刷到界面上。
+
+    回归点：ttk 控件 `w['state']` 返回 _tkinter.Tcl_Obj，和字符串比较恒为 False，
+    旧实现因此第一次就停止轮询，日志区永远空白。
+    """
+
+    def _root(self):
+        try:
+            root = tk.Tk()
+        except Exception as e:
+            self.skipTest('无可用显示：%s' % e)
+        root.withdraw()
+        return root
+
+    def _pump(self, root, seconds=0.5):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+
+    def test_poll_keeps_running_while_disabled(self):
+        root = self._root()
+        try:
+            btn = ttk.Button(root, text='x')
+            btn.configure(state='disabled')
+            txt = ScrolledText(root)
+            calls = []
+
+            class Bus:
+                def drain(self, widget):
+                    calls.append(1)
+
+            et.EpubToolApp._poll(root, Bus(), txt, btn)
+            root.update()
+            first = len(calls)
+            self._pump(root, 0.6)
+            self.assertGreater(len(calls), first, "按钮禁用期间应持续轮询")
+        finally:
+            root.destroy()
+
+    def test_poll_stops_when_enabled(self):
+        root = self._root()
+        try:
+            btn = ttk.Button(root, text='x')      # 默认 normal
+            txt = ScrolledText(root)
+            calls = []
+
+            class Bus:
+                def drain(self, widget):
+                    calls.append(1)
+
+            et.EpubToolApp._poll(root, Bus(), txt, btn)
+            root.update()
+            first = len(calls)
+            self._pump(root, 0.4)
+            self.assertEqual(len(calls), first, "按钮恢复后应停止轮询")
+        finally:
+            root.destroy()
+
+    def test_ttk_state_is_not_a_string(self):
+        """记录踩过的坑：这也是为什么必须用 instate()。"""
+        root = self._root()
+        try:
+            btn = ttk.Button(root, text='x')
+            btn.configure(state='disabled')
+            self.assertFalse(btn['state'] == 'disabled')
+            self.assertTrue(btn.instate(('disabled',)))
+        finally:
+            root.destroy()
 
 
 if __name__ == '__main__':

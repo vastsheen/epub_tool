@@ -2653,9 +2653,12 @@ class EpubToolApp(tk.Tk):
         return tab
 
     def _poll(self, bus, log, state_widget):
+        # 注意：ttk 控件取 state_widget['state'] 得到的是 _tkinter.Tcl_Obj，
+        # 它和字符串比较恒为 False（`Tcl_Obj('disabled') == 'disabled'` 是 False）。
+        # 必须用 instate()，否则这里第一次就退出，日志区永远空着。
         def step():
             bus.drain(log)
-            if state_widget['state'] == 'disabled':
+            if state_widget.instate(('disabled',)):
                 self.after(120, step)
         step()
 
