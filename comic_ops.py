@@ -35,7 +35,7 @@ from xml.sax.saxutils import escape
 
 IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.tif', '.tiff')
 
-CHAPTER_RE = re.compile(r'^\s*(\d+)\s*[_\-. ]\s*(\d+)\s*$')
+CHAPTER_RE = re.compile(r'^\s*(\d+|[A-Za-z]+)\s*[_\-. ]\s*(\d+)\s*$')
 SINGLE_RE = re.compile(r'^\s*(\d+)\s*$')
 
 DEP_HINT = ('缺少依赖：%s\n\n“漫画→CBZ”功能需要 Pillow / pypdf / cryptography，'
@@ -73,7 +73,12 @@ def deps_available():
 # ---------------------------------------------------------------- 命名与分组
 
 def parse_stem(stem):
-    """'001_01' -> ('001', '01')；'005' -> ('005', None)；'cover' -> (None, None)"""
+    """'001_01' -> ('001', '01')；'z_01' -> ('z', '01')；
+    '005' -> ('005', None)；'cover' -> (None, None)
+
+    注意：单段纯数字（'005'）返回的 chapter 只是“疑似话号”，
+    真正决定它是不是话号的是 collect_groups 里的整目录判定。
+    """
     m = CHAPTER_RE.match(stem)
     if m:
         return m.group(1), m.group(2)
@@ -86,6 +91,21 @@ def parse_stem(stem):
 def natural_key(s):
     """按数字大小而非字典序排序：第2话 < 第10话。"""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+DIR_CHAPTER_RE = re.compile(r'第\s*(\d+)\s*[话話章卷回集部季]')
+
+
+def dir_chapter(dirpath):
+    """目录名 -> 话号：'第12话' -> '12'；'12' -> '12'；其他 -> 目录名本身"""
+    name = os.path.basename(os.path.normpath(dirpath)) or '0'
+    m = DIR_CHAPTER_RE.search(name)
+    if m:
+        return m.group(1)
+    m = re.fullmatch(r'\s*(\d+)\s*', name)
+    if m:
+        return m.group(1)
+    return name
 
 
 VOL_RE = re.compile(r'第\s*(\d+)\s*卷[\s\-—_]*(.*)')
@@ -101,24 +121,50 @@ def parse_pdf_name(path):
     return (m.group(1) if m else '00'), stem
 
 
-def collect_groups(root):
-    """扫描图片目录 -> {(相对目录, 话号): [(排序键, 路径), ...]}"""
+def collect_groups(root, log=None):
+    """扫描图片目录 -> {(相对目录, 话号): [(排序键, 路径), ...]}
+
+    分组规则（按目录判定）：
+      1. 目录里有 `X_Y`（X 是数字或字母）-> 按 X 分话，Y 只决定页序
+         `001_01/001_02/002_01` -> 第001话(2页) + 第002话(1页)
+         `a_01/a_02/b_01`       -> a 一话 + b 一话
+      2. 目录里只有单段纯数字 `001.jpg/002.jpg` -> **整个目录一话**，按自然序当页序
+         （它们是页号，不是话号；早先按话号处理会产出一堆单页 CBZ）
+      3. 目录里没有编号 -> 整个目录一话，话号取目录名（'第12话' -> 12）
+    """
     groups = {}
     for dirpath, dirs, files in os.walk(root):
         dirs.sort()
         files.sort()
         rel = os.path.relpath(dirpath, root)
         rel = '' if rel == '.' else rel
-        for fn in files:
-            if not fn.lower().endswith(IMAGE_EXT):
-                continue
-            stem = os.path.splitext(fn)[0]
-            chapter, seg = parse_stem(stem)
-            if chapter is None:
-                chapter = os.path.basename(dirpath) or '0'
-                seg = None
-            seq = (0, int(seg)) if seg is not None else (1, natural_key(stem))
-            groups.setdefault((rel, chapter), []).append((seq, os.path.join(dirpath, fn)))
+        images = [f for f in files if f.lower().endswith(IMAGE_EXT)]
+        if not images:
+            continue
+
+        parsed = [(f,) + parse_stem(os.path.splitext(f)[0]) for f in images]
+        with_seg = [p for p in parsed if p[2] is not None]
+        plain = [p for p in parsed if p[2] is None]
+
+        if log and with_seg and plain:
+            log('  注意：%s 里混用了「话_页」和单编号命名，单编号文件归到目录那一话'
+                % (rel or '.'))
+
+        if with_seg:
+            for fn, chapter, seg in with_seg:
+                key = (rel, chapter)
+                groups.setdefault(key, []).append(
+                    ((0, int(seg), natural_key(fn)), os.path.join(dirpath, fn)))
+            leftovers = plain
+        else:
+            leftovers = parsed
+
+        if leftovers:
+            key = (rel, dir_chapter(dirpath))
+            for fn, _c, _s in leftovers:
+                groups.setdefault(key, []).append(
+                    ((1, natural_key(fn)), os.path.join(dirpath, fn)))
+
     for key in groups:
         groups[key].sort(key=lambda t: t[0])
     return groups
@@ -391,7 +437,7 @@ def convert(src, outdir, series='', mode='auto', log=None, progress=None,
         return results
 
     kw = dict(img_kw or {})
-    groups = collect_groups(src)
+    groups = collect_groups(src, log=log)
     if not groups:
         raise ValueError('没有找到图片（jpg / png / webp …）')
     keys = sorted(groups, key=lambda k: (natural_key(k[0]), natural_key(k[1])))

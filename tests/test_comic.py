@@ -63,6 +63,8 @@ class TempDirCase(unittest.TestCase):
 class TestNaming(unittest.TestCase):
     def test_parse_stem(self):
         self.assertEqual(co.parse_stem('001_01'), ('001', '01'))
+        self.assertEqual(co.parse_stem('z_01'), ('z', '01'))
+        self.assertEqual(co.parse_stem('a-3'), ('a', '3'))
         self.assertEqual(co.parse_stem('005'), ('005', None))
         self.assertEqual(co.parse_stem('12-3'), ('12', '3'))
         self.assertEqual(co.parse_stem('cover'), (None, None))
@@ -108,6 +110,52 @@ class TestCollectGroups(TempDirCase):
         self._touch('某话', 'cover.jpg')
         groups = co.collect_groups(self.tmp)
         self.assertEqual(list(groups)[0][1], '某话')
+
+    # ---- v1.3 分组规则修正 ----
+
+    def test_single_numbered_images_are_pages_not_chapters(self):
+        """001.jpg/002.jpg 是页号，整个目录只能算一话。"""
+        for n in ('001.jpg', '002.jpg', '010.jpg'):
+            self._touch(n)
+        groups = co.collect_groups(self.tmp)
+        self.assertEqual(len(groups), 1)
+        files = [os.path.basename(p) for _, p in groups[list(groups)[0]]]
+        self.assertEqual(files, ['001.jpg', '002.jpg', '010.jpg'])
+
+    def test_letter_prefix_is_a_chapter_key(self):
+        for n in ('a_01.jpg', 'a_02.jpg', 'b_01.jpg'):
+            self._touch(n)
+        groups = co.collect_groups(self.tmp)
+        self.assertEqual(sorted(g[1] for g in groups), ['a', 'b'])
+        self.assertEqual(len(groups[('', 'a')]), 2)
+
+    def test_single_letter_prefix_stays_one_chapter(self):
+        for n in ('z_01.jpg', 'z_02.jpg', 'z_10.jpg'):
+            self._touch(n)
+        groups = co.collect_groups(self.tmp)
+        self.assertEqual(len(groups), 1)
+        files = [os.path.basename(p) for _, p in groups[('', 'z')]]
+        self.assertEqual(files, ['z_01.jpg', 'z_02.jpg', 'z_10.jpg'])
+
+    def test_dir_name_supplies_chapter_number(self):
+        for n in ('001.jpg', '002.jpg'):
+            self._touch('第12话', n)
+        groups = co.collect_groups(self.tmp)
+        self.assertEqual([k[1] for k in groups], ['12'])
+
+    def test_mixed_naming_keeps_plain_files_with_dir(self):
+        for n in ('z_01.jpg', 'z_02.jpg', '01.jpg'):
+            self._touch(n)
+        groups = co.collect_groups(self.tmp)
+        # z 一话 + 目录名那一话（单编号文件）
+        self.assertEqual(sorted(g[1] for g in groups), sorted([os.path.basename(self.tmp), 'z']))
+
+    def test_mixed_naming_logs_a_warning(self):
+        for n in ('z_01.jpg', '01.jpg'):
+            self._touch(n)
+        msgs = []
+        co.collect_groups(self.tmp, log=msgs.append)
+        self.assertTrue(any('混用' in m for m in msgs), msgs)
 
 
 # ---------------------------------------------------------------- 白带切分
