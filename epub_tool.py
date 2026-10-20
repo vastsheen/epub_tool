@@ -125,23 +125,84 @@ def first_nonempty(lines):
     return "", []
 
 
+TERMINAL_PUNCT = '。！？…”』」】）.!?'
+
+
+def reconstruct_paragraphs(lines):
+    """物理行 -> 段落列表。
+
+    中文小说 txt 常见形态：行首「　　」标记段落，其余换行只是按固定宽度折行。
+    若直接一行一段，折行会被当成新段落（一本书能多出几万段）。这里：
+      1. 原文确实大量使用行首全角空格时，只有带标记的行才开新段，其余为续行；
+      2. 段尾不是句末标点（，、：等）或引号未闭合时，与下一行合并——修复折行处
+         被误插段落标记造成的假分段；但下一段以「“」开头时不再合并，避免把
+         新对话吞进上一段；
+      3. 完全没有全角空格标记时保持旧的「一行一段」行为，避免把普通文本并成一片。
+    """
+    marked = sum(1 for ln in lines if ln.startswith('\u3000'))
+    total = sum(1 for ln in lines if ln.strip())
+    use_marker = marked >= 2 and marked >= total * 0.3
+
+    paras = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        s = ln.strip()
+        if use_marker and ln.startswith('\u3000'):
+            paras.append(s)
+        elif use_marker and paras:
+            paras[-1] += s
+        else:
+            paras.append(s)
+
+    merged = []
+    for p in paras:
+        if merged:
+            prev = merged[-1]
+            broken = (prev.count('“') > prev.count('”') and not p.startswith('“')) \
+                or prev[-1] not in TERMINAL_PUNCT
+            if broken and len(prev) + len(p) <= 300:
+                merged[-1] = prev + p
+                continue
+        merged.append(p)
+    return merged
+
+
 def to_html_blocks(lines, base_level=2):
     """文本行 -> HTML 块；支持简单 markdown 标题（# 开头）。
 
     章节标题本身已经是 h1，所以正文里的小标题从 h2 起：
-    `#` -> <h2>、`##` -> <h3>……最多到 <h6>，不会和章节标题抢层级。"""
+    `#` -> <h2>、`##` -> <h3>……最多到 <h6>，不会和章节标题抢层级。
+
+    段落先按行首全角空格还原（见 reconstruct_paragraphs），其余换行视为折行。
+    每章首段额外写入两个全角空格并内联 text-indent:0——部分阅读器（如 Komga
+    的 web 阅读器）会把「标题后第一段」的缩进强制归零，文字级缩进可以绕开；
+    其余段落仍由 CSS text-indent:2em 负责，两者不会叠加。"""
     blocks = []
+    buf = []
+    state = {'first': True}
+
+    def flush():
+        for p in reconstruct_paragraphs(buf):
+            text = html.escape(p)
+            if state['first']:
+                blocks.append('<p style="text-indent:0">\u3000\u3000%s</p>' % text)
+                state['first'] = False
+            else:
+                blocks.append('<p>%s</p>' % text)
+        del buf[:]
+
     for ln in lines:
         s = ln.strip()
-        if not s:
-            continue
         if s.startswith('#'):
+            flush()
             n = len(s) - len(s.lstrip('#')) or 1
             level = min(6, base_level + n - 1)
             text = html.escape(s.lstrip('#').strip())
             blocks.append('<h%d>%s</h%d>' % (level, text, level))
         else:
-            blocks.append('<p>%s</p>' % html.escape(s))
+            buf.append(ln)
+    flush()
     return '\n'.join(blocks)
 
 
@@ -525,7 +586,7 @@ def split_by_dash(lines):
 
 def split_by_title_regex(lines):
     """按“第X章/回/卷”标题行切分。"""
-    pat = re.compile(r'^第[一二三四五六七八九十百千0-9０-９]+[章回卷]')
+    pat = re.compile(r'^第[〇零一二三四五六七八九十百千万两0-9０-９]+[章回卷节]')
     idxs = [i for i, ln in enumerate(lines) if pat.match(ln.strip())]
     if not idxs:
         return None
@@ -1311,6 +1372,34 @@ def selftest():
     # 功能2b：标题正则切割
     chs2b = split_file(single, "章节标题正则（第X章）")
     check("功能2b 标题正则切割识别 3 章", len(chs2b) == 3 and chs2b[0][0] == "第一章 A")
+
+    # 功能2c：段落还原（行首全角空格分段 / 折行合并 / 首段缩进）
+    para_txt = os.path.join(work, "段落.txt")
+    with open(para_txt, 'w', encoding='utf-8') as f:
+        f.write("------------\n第一章 段落测试\n"
+                "\u3000\u3000第一段开头，这一句被硬折行拆成了\n"
+                "\u3000\u3000两半，应当合成一段。\n"
+                "\u3000\u3000“这是对话？\n"
+                "\u3000\u3000不可能，不可能啊！”\n"
+                "\u3000\u3000旁白另起一段。\n")
+    e_para = os.path.join(work, "段落书.epub")
+    build_epub(split_file(para_txt, "整行12个横线分隔（大明测字天师式）"), "段落书", e_para)
+    with zipfile.ZipFile(e_para) as z:
+        html_para = z.read("OEBPS/chap_0001.xhtml").decode('utf-8')
+    ps = re.findall(r'<p[^>]*>(.*?)</p>', html_para, re.S)
+    check("功能2c 段落还原为 3 段", len(ps) == 3)
+    check("功能2c 首段带缩进", bool(ps) and ps[0].startswith('\u3000\u3000')
+          and 'style="text-indent:0"' in html_para)
+    check("功能2c 折行已合并", len(ps) > 1 and ps[0].endswith('应当合成一段。')
+          and ps[1] == '“这是对话？不可能，不可能啊！”')
+    check("功能2c 旁白独立成段", len(ps) > 2 and ps[2] == '旁白另起一段。')
+
+    # 功能2d：章号含「零」也能识别
+    zero_txt = os.path.join(work, "零章.txt")
+    with open(zero_txt, 'w', encoding='utf-8') as f:
+        f.write("第一百零一章 甲\n正文甲。\n第一百零二章 乙\n正文乙。\n")
+    chs_zero = split_file(zero_txt, "章节标题正则（第X章）")
+    check("功能2d 含「零」章号可切分", chs_zero is not None and len(chs_zero) == 2)
 
     # 功能3：追加章节
     e3 = os.path.join(work, "目录书_追加.epub")
